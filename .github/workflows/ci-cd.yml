@@ -81,7 +81,6 @@ jobs:
     needs: [build]
     env:
       REGISTRY: ghcr.io
-      IMAGE_NAME: ${{ github.repository }}
     outputs:
       image_tag: ${{ steps.set_output.outputs.image_tag }}
     steps:
@@ -104,16 +103,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.TOKEN }}
 
+      # NEW STEP — normalize repo name to lowercase
+      - name: Set lowercase image name
+        id: image
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=sha,format=long
             type=ref,event=branch
 
-      # Build ONCE, load into local Docker daemon (not pushed yet)
       - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
@@ -123,18 +126,16 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Scan the EXACT image we just built — not a rebuild
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          image-ref: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:sha-${{ github.sha }}
           format: 'table'
           exit-code: '1'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
-      # Only reaches here if Trivy passed — push the SAME already-scanned image
       - name: Push Docker image
         uses: docker/build-push-action@v5
         with:
