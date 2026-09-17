@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app
+  labels:
+    app: devsecops-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: devsecops-app
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+    spec:
+      containers:
+      - name: devsecops-app
+        image: ghcr.io/narayananraj/devsecops-pipeline:sha-fb64dc2ac8cd8d79ad4a75c58326596b59eaf402
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        resources:
+          limits:
+            cpu: "0.5"
+            memory: "512Mi"
+          requests:
+            cpu: "0.2"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      imagePullSecrets:
+      - name: github-container-registry
