@@ -181,7 +181,7 @@ jobs:
           echo "Updated deployment to use image: ${NEW_IMAGE}"
           grep -A 1 "image:" kubernetes/deployment.yaml
 
-      - name: Commit and push changes
+      - name: Commit and push changes into the repository
         run: |
           git add kubernetes/deployment.yaml
           git commit -m "Update Kubernetes deployment with new image tag: sha-$(echo ${{ github.sha }} | cut -c1-7) [skip ci]" || echo "No changes to commit"
