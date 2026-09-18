@@ -6,6 +6,7 @@ on:
       - main
     paths-ignore:
       - 'kubernetes/deployment.yaml'
+      - '.github/workflows/README.md'
   pull_request:
     branches:
       - main

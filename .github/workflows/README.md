@@ -1,10 +1,10 @@
-# GitHub Actions Workflows
+# CI/CD Pipeline — DevSecOps Workflow
 
-This directory contains the CI/CD automation for the DevSecOps pipeline project.
+This directory contains the GitHub Actions automation that drives the complete build-to-deploy lifecycle for this project, implementing DevSecOps practices at every stage: automated quality gates, container vulnerability scanning, and GitOps-based deployment.
 
 ## Workflow File
 
-- `ci-cd.yml` — main build, test, lint, vulnerability-scan, and container image workflow
+- `ci-cd.yml` — five-stage pipeline covering testing, static analysis, build, container security scanning, and Kubernetes manifest updates
 
 ## Trigger Conditions
 
@@ -13,115 +13,117 @@ The workflow runs on:
 - Pushes to the `main` branch
 - Pull requests targeting `main`
 
-It ignores changes to `kubernetes/deployment.yaml` when triggered by push, which helps avoid redundant rebuilds for deployment manifest-only updates.
+Pushes that **only** modify `kubernetes/deployment.yaml` are ignored (`paths-ignore`). This exists because the pipeline itself commits to that file in its final stage — without this exclusion, every automated deployment update would re-trigger the entire pipeline, creating an infinite loop.
 
-## Pipeline Overview
+## Pipeline Architecture
 
-The workflow is organized into a sequential pipeline with dependency gates:
+The workflow enforces a sequential quality-gate model — each stage must pass before the next begins, and no stage can be silently bypassed on failure.
 
-1. `test`
-   - Runs unit tests with Vitest
-   - Ensures the application logic passes after each change
+```
+┌──────┐   ┌──────┐
+│ test │   │ lint │   (parallel — no dependency between them)
+└───┬──┘   └───┬──┘
+    └─────┬─────┘
+      ┌───▼───┐
+      │ build │
+      └───┬───┘
+      ┌───▼────┐
+      │ docker │   (build → scan → push, single build reused throughout)
+      └───┬────┘
+   ┌──────▼───────┐
+   │  update-k8s  │   (GitOps commit — triggers ArgoCD sync)
+   └──────────────┘
+```
 
-2. `lint`
-   - Runs ESLint static analysis
-   - Validates code quality and catches common issues
+## Stage Breakdown
 
-3. `build`
-   - Depends on `test` and `lint`
-   - Installs dependencies and compiles the Vite production bundle
-   - Uploads the built artifacts from `dist/`
+### 1. Test
 
-4. `docker`
-   - Depends on `build`
-   - Downloads the build output
-   - Configures Docker Buildx
-   - Logs in to GitHub Container Registry (GHCR)
-   - Builds the Docker image
-   - Scans the image with Trivy
-   - Pushes the image to GHCR when the scan passes
+- **Runner:** `ubuntu-latest`
+- Checks out the repository
+- Installs Node.js with dependency caching enabled
+- Installs dependencies via `npm ci` (reproducible, lockfile-exact install)
+- Runs the unit test suite
 
-## Job Details
+### 2. Lint
 
-### Test Job
+- **Runner:** `ubuntu-latest`, runs in parallel with `test`
+- Same checkout and dependency setup
+- Runs static code analysis to catch quality and style issues before they reach a build
 
-- Runner: `ubuntu-latest`
-- Checkout code
-- Set up Node.js 20 with npm cache
-- Run `npm ci`
-- Execute `npm test`
+### 3. Build
 
-### Lint Job
+- **Depends on:** `test`, `lint` (both must succeed)
+- Compiles the production bundle
+- Uploads the build output as a workflow artifact, so downstream stages consume the exact same build rather than recompiling
 
-- Runner: `ubuntu-latest`
-- Checkout code
-- Set up Node.js 20 with npm cache
-- Run `npm ci`
-- Execute `npm run lint`
+### 4. Docker — Build, Scan, and Push
 
-### Build Job
+- **Depends on:** `build`
+- Downloads the build artifact (no rebuild)
+- Sets up Docker Buildx and authenticates to GitHub Container Registry (GHCR)
+- Normalizes the repository name to lowercase, since OCI image references must be lowercase-only while GitHub repository names may contain mixed case
+- Generates immutable, SHA-based image tags (no mutable `latest` tag, to keep every deployed image traceable to an exact commit)
+- **Builds the image once**, loading it into the local Docker daemon without pushing
+- Scans that exact image with Trivy for `CRITICAL` and `HIGH` severity vulnerabilities across OS packages and application libraries
+- The workflow fails immediately if vulnerabilities are found — the push step never executes on a failed scan
+- Only after a clean scan does the same, already-scanned image get pushed to GHCR
 
-- Runner: `ubuntu-latest`
-- Waits for `test` and `lint` to finish successfully
-- Builds the production bundle with `npm run build`
-- Uploads the generated `dist/` directory as a workflow artifact
+This build-once-scan-then-push sequence ensures the image that gets scanned is exactly the image that gets deployed — there is no separate rebuild between security validation and registry push.
 
-### Docker Job
+### 5. Update Kubernetes Deployment (GitOps)
 
-- Runner: `ubuntu-latest`
-- Downloads build artifacts
-- Builds the image using the repository Dockerfile
-- Uses Trivy to scan for `CRITICAL` and `HIGH` vulnerabilities
-- Fails the workflow if vulnerabilities are found
-- Pushes the final image to GHCR using image metadata tags
+- **Depends on:** `docker`, and only runs on a direct push to `main` (not on pull requests)
+- Checks out the repository with write access
+- Recomputes the lowercase image name and constructs the new image reference using the commit SHA
+- Updates the image tag in `kubernetes/deployment.yaml` in place
+- Commits and pushes the change back to the repository, with `[skip ci]` in the commit message so this automated commit does not re-trigger the pipeline
+
+This stage is the bridge into GitOps: it does not deploy anything directly. Instead, it updates the desired state in Git, which a GitOps controller (ArgoCD) watches and syncs to the cluster automatically. This gives a complete, auditable trail — every production image change is a Git commit, not a manual `kubectl apply`.
 
 ## Container Registry Setup
 
-This workflow expects a GitHub Actions secret named `TOKEN` to authenticate to GHCR.
-
-The workflow does the following:
-
-- Uses `docker/login-action@v3`
-- Authenticates as `github.actor`
-- Publishes the image under the repository name in lowercase
-- Creates tags based on commit SHA and branch name
+- Registry: `ghcr.io` (GitHub Container Registry)
+- Authenticates as `github.actor` using a GitHub Actions secret named `TOKEN`
+- Images are published under the lowercase repository name
+- Tagged by full commit SHA and branch reference
 
 ## Security Controls
 
-The Docker stage includes a vulnerability gate using Trivy:
+| Control | Configuration |
+|---|---|
+| Vulnerability scanner | Trivy |
+| Scan scope | `os`, `library` |
+| Severity gate | `CRITICAL`, `HIGH` |
+| Failure behavior | `exit-code: 1` — blocks the pipeline, no silent pass-through |
+| Noise reduction | `ignore-unfixed: true` — skips vulnerabilities with no available patch |
 
-- `vuln-type: 'os,library'`
-- `severity: 'CRITICAL,HIGH'`
-- `exit-code: '1'`
-- `ignore-unfixed: true`
-
-This means the workflow will fail if the built image contains high-impact vulnerabilities that are still unpatched.
+No step in this pipeline uses failure-suppression patterns (`continue-on-error`, `|| true`, or equivalent) on a quality or security check. Every gate either passes cleanly or stops the pipeline.
 
 ## Artifacts
 
-The build job stores the production bundle as a workflow artifact named:
+| Artifact | Produced by | Consumed by |
+|---|---|---|
+| `build-artifacts` | `build` | `docker` |
 
-- `build-artifacts`
+## GitOps Integration
 
-This artifact is then used in the Docker job.
+This workflow's final responsibility ends at updating the deployment manifest in Git. Cluster-side reconciliation is handled by ArgoCD, configured separately to watch the `kubernetes/` path of this repository and auto-sync on change, with self-healing enabled to correct any manual drift in the cluster back to the Git-defined state.
 
 ## Notes
 
-- The workflow currently focuses on build validation and container security.
-- Kubernetes deployment manifests are not automatically applied by this workflow.
-- You may extend this workflow with deployment jobs for staging or production environments if needed.
-- Repository-specific values such as image names, registry credentials, and deployment targets may require environment-specific configuration.
+- Repository-specific values (registry credentials, image names) are resolved dynamically within the workflow and require no manual editing between environments.
+- Kubernetes manifests are not applied directly by this workflow — deployment is fully GitOps-driven via ArgoCD.
+- Ingress and TLS configuration are intentionally excluded from the current manifest set and can be layered in for environments with a real domain.
 
 ## Local Equivalent
 
-The workflow mirrors the following local commands:
+The following commands approximate what the pipeline validates, for local verification before pushing:
 
 ```bash
 npm ci
 npm test
 npm run lint
 npm run build
-docker build -t devsecops-pipeline .
+docker build -t <image-name> .
 ```
-
-These commands provide the same checks the pipeline enforces in GitHub Actions.
